@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,6 +57,13 @@ type responsesResponse struct {
 		Type    string `json:"type"`
 		Code    string `json:"code"`
 	} `json:"error,omitempty"`
+}
+
+type modelsListResponse struct {
+	Data []struct {
+		ID      string `json:"id"`
+		OwnedBy string `json:"owned_by"`
+	} `json:"data"`
 }
 
 type tokenUsage struct {
@@ -490,18 +498,18 @@ func callChatGPTWithUsage(ctx context.Context, client *http.Client, apiKey strin
 	}
 }
 
-func callChatGPTStream(ctx context.Context, client *http.Client, apiKey string, control requestControl, prompt string, onDelta func(string)) error {
+func callChatGPTStream(ctx context.Context, client *http.Client, apiKey string, control requestControl, prompt string, onDelta func(string)) (tokenUsage, error) {
 	if strings.TrimSpace(apiKey) == "" {
-		return errors.New("missing OPENAI_API_KEY")
+		return tokenUsage{}, errors.New("missing OPENAI_API_KEY")
 	}
 	if strings.TrimSpace(prompt) == "" {
-		return errors.New("prompt is empty")
+		return tokenUsage{}, errors.New("prompt is empty")
 	}
 	if strings.TrimSpace(control.Gen.Model) == "" {
 		control.Gen.Model = "gpt-5.2"
 	}
 	if err := validateParams(control.Gen); err != nil {
-		return err
+		return tokenUsage{}, err
 	}
 
 	temp := control.Gen.Temperature
@@ -529,7 +537,7 @@ func callChatGPTStream(ctx context.Context, client *http.Client, apiKey string, 
 		Stream: true,
 	})
 	if err != nil {
-		return err
+		return tokenUsage{}, err
 	}
 
 	newRequest := func() (*http.Request, error) {
@@ -547,19 +555,19 @@ func callChatGPTStream(ctx context.Context, client *http.Client, apiKey string, 
 	for attempt := 0; ; attempt++ {
 		req, err := newRequest()
 		if err != nil {
-			return err
+			return tokenUsage{}, err
 		}
 
 		resp, err := client.Do(req)
 		if err != nil {
-			return err
+			return tokenUsage{}, err
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			raw, readErr := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
 			if readErr != nil {
-				return readErr
+				return tokenUsage{}, readErr
 			}
 			var apiErr responsesResponse
 			_ = json.Unmarshal(raw, &apiErr)
@@ -586,12 +594,12 @@ func callChatGPTStream(ctx context.Context, client *http.Client, apiKey string, 
 				select {
 				case <-ctx.Done():
 					t.Stop()
-					return ctx.Err()
+					return tokenUsage{}, ctx.Err()
 				case <-t.C:
 				}
 				continue
 			}
-			return err
+			return tokenUsage{}, err
 		}
 
 		// SSE format may send "event:" lines + JSON in "data:" lines.
@@ -602,6 +610,7 @@ func callChatGPTStream(ctx context.Context, client *http.Client, apiKey string, 
 			dataLines  []string
 			seenOutput bool
 			emitted    strings.Builder
+			usage      tokenUsage
 		)
 
 		stopMarker := strings.TrimSpace(control.StopMarker)
@@ -707,11 +716,23 @@ func callChatGPTStream(ctx context.Context, client *http.Client, apiKey string, 
 
 			// Some streams include the final response object in a "completed" event.
 			if strings.Contains(typ, "response.completed") || strings.Contains(typ, "completed") {
-				if seenOutput {
-					return nil
-				}
+				// Payload can be either the response object itself, or an envelope like:
+				// { "type": "response.completed", "response": { ... } }
 				var rr responsesResponse
-				if err := json.Unmarshal([]byte(data), &rr); err != nil {
+				var env struct {
+					Response json.RawMessage `json:"response"`
+				}
+				if err := json.Unmarshal([]byte(data), &env); err == nil && len(env.Response) > 0 {
+					_ = json.Unmarshal(env.Response, &rr)
+				} else {
+					_ = json.Unmarshal([]byte(data), &rr)
+				}
+				if rr.Usage != nil {
+					usage.InputTokens = rr.Usage.InputTokens
+					usage.OutputTokens = rr.Usage.OutputTokens
+					usage.TotalTokens = rr.Usage.TotalTokens
+				}
+				if seenOutput {
 					return nil
 				}
 				if out := strings.TrimSpace(extractOutputText(rr)); out != "" {
@@ -740,7 +761,7 @@ func callChatGPTStream(ctx context.Context, client *http.Client, apiKey string, 
 			line, err := reader.ReadString('\n')
 			if err != nil && !errors.Is(err, io.EOF) {
 				_ = resp.Body.Close()
-				return err
+				return tokenUsage{}, err
 			}
 			line = strings.TrimRight(line, "\r\n")
 
@@ -751,19 +772,19 @@ func callChatGPTStream(ctx context.Context, client *http.Client, apiKey string, 
 				eventName = ""
 				if errors.Is(err2, errStop) {
 					_ = resp.Body.Close()
-					return nil
+					return usage, nil
 				}
 				if errors.Is(err2, io.EOF) {
 					_ = resp.Body.Close()
-					return nil
+					return usage, nil
 				}
 				if err2 != nil {
 					_ = resp.Body.Close()
-					return err2
+					return tokenUsage{}, err2
 				}
 				if errors.Is(err, io.EOF) {
 					_ = resp.Body.Close()
-					return nil
+					return usage, nil
 				}
 				continue
 			}
@@ -781,9 +802,12 @@ func callChatGPTStream(ctx context.Context, client *http.Client, apiKey string, 
 				_ = resp.Body.Close()
 				err2 := processEvent(eventName, data)
 				if errors.Is(err2, errStop) {
-					return nil
+					return usage, nil
 				}
-				return err2
+				if errors.Is(err2, io.EOF) || err2 == nil {
+					return usage, nil
+				}
+				return tokenUsage{}, err2
 			}
 		}
 	}
@@ -1044,46 +1068,15 @@ type sendRequest struct {
 	ControlMaxTokens int     `json:"control_max_tokens"`
 }
 
-type benchmarkRequest struct {
-	Prompt        string       `json:"prompt"`
-	SystemPrompt  string       `json:"system_prompt"`
-	Temperature   float64      `json:"temperature"`
-	TopP          float64      `json:"top_p"`
-	MaxTokens     int          `json:"max_tokens"`
-	WeakModel     string       `json:"weak_model"`
-	MidModel      string       `json:"mid_model"`
-	StrongModel   string       `json:"strong_model"`
-	WeakPricing   modelPricing `json:"weak_pricing"`
-	MidPricing    modelPricing `json:"mid_pricing"`
-	StrongPricing modelPricing `json:"strong_pricing"`
-}
-
-type benchmarkResult struct {
-	Tier       string     `json:"tier"`
-	Model      string     `json:"model"`
-	DurationMs int64      `json:"duration_ms"`
-	Usage      tokenUsage `json:"usage"`
-	CostUSD    float64    `json:"cost_usd"`
-	Answer     string     `json:"answer"`
-	Error      string     `json:"error,omitempty"`
-}
-
-type benchmarkLink struct {
-	Title string `json:"title"`
-	URL   string `json:"url"`
-}
-
-type benchmarkResponse struct {
-	Results []benchmarkResult `json:"results"`
-	Summary string            `json:"summary"`
-	Links   []benchmarkLink   `json:"links"`
-}
-
 type sseOut struct {
-	Type    string `json:"type"`
-	Variant string `json:"variant,omitempty"`
-	Delta   string `json:"delta,omitempty"`
-	Message string `json:"message,omitempty"`
+	Type       string     `json:"type"`
+	Variant    string     `json:"variant,omitempty"`
+	Delta      string     `json:"delta,omitempty"`
+	Message    string     `json:"message,omitempty"`
+	Model      string     `json:"model,omitempty"`
+	DurationMs int64      `json:"duration_ms,omitempty"`
+	Usage      tokenUsage `json:"usage,omitempty"`
+	CostUSD    float64    `json:"cost_usd,omitempty"`
 }
 
 func writeSSE(w http.ResponseWriter, f http.Flusher, v sseOut) error {
@@ -1159,6 +1152,7 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
       details { border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; background: rgba(255,255,255,0.03); }
       summary { cursor: pointer; color: var(--muted); }
       .small { font-size: 12px; color: var(--muted); }
+      .bubble .small { white-space: pre-wrap; margin-top: 8px; }
       .error { color: #ffb4b4; }
       .variantbar { display:flex; align-items:center; gap:10px; padding-bottom: 10px; margin-bottom: 10px; border-bottom: 1px solid var(--border); }
       .variantbar .nav { width: 34px; height: 30px; border-radius: 10px; border: 1px solid var(--border); background: rgba(255,255,255,0.03); color: var(--text); cursor:pointer; }
@@ -1174,10 +1168,28 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
         <div class="brand">Lesson 5</div>
         <div class="muted">Интерфейс в стиле ChatGPT + стриминг ответа. Ключ берётся из <code>OPENAI_API_KEY</code> (не уходит в браузер).</div>
 
-        <div class="field">
-          <label>Model</label>
-          <input id="model" type="text" value="{{.DefaultModel}}" />
-        </div>
+	        <div class="field">
+	          <label>Model</label>
+		          <select id="model">
+		            <option value="{{.DefaultModel}}">{{.DefaultModel}}</option>
+		          </select>
+		          <div id="models_status" class="small"></div>
+		        </div>
+
+	        <details>
+	          <summary>Pricing (selected model)</summary>
+	          <div class="small" style="margin-top:10px;">USD per 1M tokens. Если пусто — стоимость будет <code>n/a</code>.</div>
+	          <div class="row" style="margin-top:10px;">
+	            <div class="field">
+	              <label>input / 1M</label>
+	              <input id="price_in" type="text" placeholder="e.g. 0.50" />
+	            </div>
+	            <div class="field">
+	              <label>output / 1M</label>
+	              <input id="price_out" type="text" placeholder="e.g. 2.00" />
+	            </div>
+	          </div>
+	        </details>
 
         <div class="row">
           <div class="field">
@@ -1219,60 +1231,6 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
           </div>
         </details>
 
-        <details open>
-          <summary>Benchmark (3 models)</summary>
-          <div class="small" style="margin-top:10px;">Один и тот же запрос запускается на слабой/средней/сильной модели. Замер: время, токены, стоимость (если заданы цены).</div>
-          <div class="field" style="margin-top:10px;">
-            <label>Weak model</label>
-            <input id="weak_model" type="text" value="gpt-5.2-nano" />
-          </div>
-          <div class="field">
-            <label>Mid model</label>
-            <input id="mid_model" type="text" value="gpt-5.2-mini" />
-          </div>
-          <div class="field">
-            <label>Strong model</label>
-            <input id="strong_model" type="text" value="gpt-5.2" />
-          </div>
-          <details style="margin-top:10px;">
-            <summary>Pricing (USD per 1M tokens)</summary>
-            <div class="small" style="margin-top:8px;">Если оставить пустым — стоимость будет <code>n/a</code>.</div>
-            <div class="row" style="margin-top:10px;">
-              <div class="field">
-                <label>Weak in</label>
-                <input id="weak_in" type="text" placeholder="e.g. 0.20" />
-              </div>
-              <div class="field">
-                <label>Weak out</label>
-                <input id="weak_out" type="text" placeholder="e.g. 0.80" />
-              </div>
-            </div>
-            <div class="row">
-              <div class="field">
-                <label>Mid in</label>
-                <input id="mid_in" type="text" placeholder="e.g. 0.50" />
-              </div>
-              <div class="field">
-                <label>Mid out</label>
-                <input id="mid_out" type="text" placeholder="e.g. 2.00" />
-              </div>
-            </div>
-            <div class="row">
-              <div class="field">
-                <label>Strong in</label>
-                <input id="strong_in" type="text" placeholder="e.g. 3.00" />
-              </div>
-              <div class="field">
-                <label>Strong out</label>
-                <input id="strong_out" type="text" placeholder="e.g. 12.00" />
-              </div>
-            </div>
-          </details>
-          <div class="small" style="margin-top:10px;">
-            Ссылки: <a href="https://platform.openai.com/docs/models" target="_blank" rel="noreferrer">models</a> • <a href="https://platform.openai.com/pricing" target="_blank" rel="noreferrer">pricing</a>
-          </div>
-        </details>
-
         <button id="reset" class="btn">Новый чат</button>
         <div id="status" class="small"></div>
       </div>
@@ -1287,7 +1245,6 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
           <div class="composer-inner">
             <textarea id="input" placeholder="Напишите сообщение..."></textarea>
             <button id="send" class="btn primary">Send</button>
-            <button id="bench" class="btn">Benchmark</button>
           </div>
           <div class="hint">Можно включить compare/control, чтобы увидеть один и тот же запрос с разным уровнем контроля ответа.</div>
         </div>
@@ -1298,11 +1255,41 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
       const chat = document.getElementById('chat');
       const input = document.getElementById('input');
       const sendBtn = document.getElementById('send');
-      const benchBtn = document.getElementById('bench');
       const resetBtn = document.getElementById('reset');
       const statusEl = document.getElementById('status');
       let currentES = null;
       let isGenerating = false;
+
+      // initialize model dropdown from server default
+      try { document.getElementById('model').value = "{{.DefaultModel}}"; } catch {}
+      const modelsStatus = document.getElementById('models_status');
+
+      async function loadModels() {
+        try {
+          const res = await fetch('/api/models');
+          if (!res.ok) {
+            if (modelsStatus) modelsStatus.textContent = 'Не удалось загрузить список моделей.';
+            return;
+          }
+          const data = await res.json();
+          const list = data.models || [];
+          const select = document.getElementById('model');
+          const current = select.value;
+          select.innerHTML = '';
+          for (const id of list) {
+            const opt = document.createElement('option');
+            opt.value = id;
+            opt.textContent = id;
+            select.appendChild(opt);
+          }
+          // restore selection if possible
+          if (list.includes(current)) select.value = current;
+          else if (list.includes("{{.DefaultModel}}")) select.value = "{{.DefaultModel}}";
+          if (modelsStatus) modelsStatus.textContent = 'Доступно моделей: ' + String(list.length);
+        } catch {
+          if (modelsStatus) modelsStatus.textContent = 'Не удалось загрузить список моделей.';
+        }
+      }
 
       const el = (tag, cls, text) => {
         const node = document.createElement(tag);
@@ -1316,7 +1303,14 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
       function addMessage(role, text, label) {
         const wrap = el('div', 'msg ' + role);
         const meta = el('div', 'meta', label || (role === 'user' ? 'You' : 'Assistant'));
-        const bubble = el('div', 'bubble', text || '');
+
+        const bubble = el('div', 'bubble');
+        const textEl = el('div', '', text || '');
+        const footerEl = el('div', 'small', '');
+        bubble.appendChild(textEl);
+        // show footer only for assistant-ish messages
+        if (role !== 'user') bubble.appendChild(footerEl);
+
         if (role === 'user') {
           wrap.appendChild(bubble);
           wrap.appendChild(meta);
@@ -1326,7 +1320,7 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
         }
         chat.appendChild(wrap);
         scrollToBottom();
-        return bubble;
+        return { textEl, footerEl };
       }
 
       async function loadHistory() {
@@ -1365,18 +1359,9 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
         const control = document.getElementById('control').checked;
         const control_max_tokens = Math.trunc(parseNum(document.getElementById('control_max_tokens').value, 120));
         const system_prompt = (document.getElementById('system_prompt').value || '').trim();
-
-        const weak_model = (document.getElementById('weak_model').value || '').trim();
-        const mid_model = (document.getElementById('mid_model').value || '').trim();
-        const strong_model = (document.getElementById('strong_model').value || '').trim();
-        const weak_in = parseNum(document.getElementById('weak_in').value, 0);
-        const weak_out = parseNum(document.getElementById('weak_out').value, 0);
-        const mid_in = parseNum(document.getElementById('mid_in').value, 0);
-        const mid_out = parseNum(document.getElementById('mid_out').value, 0);
-        const strong_in = parseNum(document.getElementById('strong_in').value, 0);
-        const strong_out = parseNum(document.getElementById('strong_out').value, 0);
-
-        return { model, temperature, top_p, compare, control, control_max_tokens, system_prompt, weak_model, mid_model, strong_model, weak_in, weak_out, mid_in, mid_out, strong_in, strong_out };
+        const price_in = parseNum(document.getElementById('price_in').value, 0);
+        const price_out = parseNum(document.getElementById('price_out').value, 0);
+        return { model, temperature, top_p, compare, control, control_max_tokens, system_prompt, price_in, price_out };
       }
 
       function setStatus(text, isError) {
@@ -1384,56 +1369,69 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
         statusEl.className = 'small' + (isError ? ' error' : '');
       }
 
-      function addVariantMessage() {
-        const wrap = el('div', 'msg assistant');
-        const meta = el('div', 'meta', 'Assistant');
-        const bubble = el('div', 'bubble');
+	      function addVariantMessage() {
+	        const wrap = el('div', 'msg assistant');
+	        const meta = el('div', 'meta', 'Assistant');
+	        const bubble = el('div', 'bubble');
 
         const bar = el('div', 'variantbar');
         const prev = el('button', 'nav', '◀');
         const next = el('button', 'nav', '▶');
-        const count = el('div', 'count', '1/2');
-        const label = el('div', 'label', 'Без ограничений');
-        const text = el('div', 'varianttext', '...');
+	        const count = el('div', 'count', '1/2');
+	        const label = el('div', 'label', 'Без ограничений');
+	        const small = el('div', 'small', '');
+	        const text = el('div', 'varianttext', '...');
         bar.appendChild(prev);
         bar.appendChild(count);
         bar.appendChild(next);
-        bar.appendChild(label);
-        bubble.appendChild(bar);
-        bubble.appendChild(text);
+	        bar.appendChild(label);
+	        bubble.appendChild(bar);
+	        bubble.appendChild(small);
+	        bubble.appendChild(text);
 
         wrap.appendChild(meta);
         wrap.appendChild(bubble);
         chat.appendChild(wrap);
         scrollToBottom();
 
-        const state = {
-          selected: 'uncontrolled',
-          buffers: { uncontrolled: '', controlled: '' },
-          label,
-          count,
-          text,
-          setSelected: function(variant) {
-            this.selected = variant;
-            if (variant === 'controlled') {
-              this.count.textContent = '2/2';
-              this.label.textContent = 'С ограничениями';
-              this.text.textContent = this.buffers.controlled || '...';
-            } else {
-              this.count.textContent = '1/2';
-              this.label.textContent = 'Без ограничений';
-              this.text.textContent = this.buffers.uncontrolled || '...';
-            }
-            scrollToBottom();
-          },
-          append: function(variant, delta) {
-            this.buffers[variant] += delta;
-            if (this.selected === variant) {
-              this.text.textContent = this.buffers[variant];
-              scrollToBottom();
-            }
-          }
-        };
+	        const state = {
+	          selected: 'uncontrolled',
+	          buffers: { uncontrolled: '', controlled: '' },
+	          meta: { uncontrolled: '', controlled: '' },
+	          label,
+	          count,
+	          small,
+	          text,
+	          setSelected: function(variant) {
+	            this.selected = variant;
+	            if (variant === 'controlled') {
+	              this.count.textContent = '2/2';
+	              this.label.textContent = 'С ограничениями';
+	              this.small.textContent = this.meta.controlled || '';
+	              this.text.textContent = this.buffers.controlled || '...';
+	            } else {
+	              this.count.textContent = '1/2';
+	              this.label.textContent = 'Без ограничений';
+	              this.small.textContent = this.meta.uncontrolled || '';
+	              this.text.textContent = this.buffers.uncontrolled || '...';
+	            }
+	            scrollToBottom();
+	          },
+	          append: function(variant, delta) {
+	            this.buffers[variant] += delta;
+	            if (this.selected === variant) {
+	              this.text.textContent = this.buffers[variant];
+	              scrollToBottom();
+	            }
+	          },
+	          setMeta: function(variant, metaText) {
+	            this.meta[variant] = metaText || '';
+	            if (this.selected === variant) {
+	              this.small.textContent = this.meta[variant] || '';
+	              scrollToBottom();
+	            }
+	          }
+	        };
 
         prev.addEventListener('click', () => state.setSelected(state.selected === 'controlled' ? 'uncontrolled' : 'uncontrolled'));
         next.addEventListener('click', () => state.setSelected(state.selected === 'uncontrolled' ? 'controlled' : 'controlled'));
@@ -1507,6 +1505,22 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
         return state;
       }
 
+      function formatMetrics(ev) {
+        const u = ev.usage || {};
+        const inTok = u.InputTokens || 0;
+        const outTok = u.OutputTokens || 0;
+        const ms = ev.duration_ms || 0;
+        const model = ev.model || '';
+        const cost = (ev.cost_usd && ev.cost_usd > 0) ? ('$' + ev.cost_usd.toFixed(6)) : 'n/a';
+        const timeLine = 'Время ответа: ' + String(ms) + ' ms — время запроса к API (end-to-end).';
+        const tokensLine = (inTok === 0 && outTok === 0)
+          ? 'Токены: n/a — usage не вернулся от API (для некоторых аккаунтов/моделей/режимов стрима).'
+          : 'Токены: in ' + String(inTok) + ' / out ' + String(outTok) + ' — токены в запросе/контексте и в ответе.';
+        const costLine = 'Стоимость: ' + String(cost) + ' — оценка по Pricing (USD за 1M токенов) для выбранной модели.';
+        const modelLine = 'Модель: ' + String(model) + '.';
+        return modelLine + '\n' + timeLine + '\n' + tokensLine + '\n' + costLine;
+      }
+
       async function sendMessage() {
         if (isGenerating) return;
         const msg = input.value.trim();
@@ -1529,6 +1543,8 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
         q.set('control', settings.control ? '1' : '0');
         q.set('control_max_tokens', String(settings.control_max_tokens));
         if (settings.system_prompt) q.set('system_prompt', settings.system_prompt);
+        if (settings.price_in) q.set('price_in', String(settings.price_in));
+        if (settings.price_out) q.set('price_out', String(settings.price_out));
 
         const es = new EventSource('/api/send_sse?' + q.toString());
         currentES = es;
@@ -1555,7 +1571,8 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
               if (!bubbles[variant]) {
                 bubbles[variant] = addMessage('assistant', '', label);
               } else {
-                bubbles[variant].textContent = '';
+                bubbles[variant].textEl.textContent = '';
+                if (bubbles[variant].footerEl) bubbles[variant].footerEl.textContent = '';
               }
             } else {
               // default selected is uncontrolled; no-op
@@ -1573,8 +1590,20 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
               const label = variant === 'controlled' ? 'Assistant (controlled)' : 'Assistant';
               bubbles[variant] = addMessage('assistant', '', label);
             }
-            bubbles[variant].textContent += ev.delta || '';
+            bubbles[variant].textEl.textContent += ev.delta || '';
             scrollToBottom();
+            return;
+          }
+	          if (ev.type === 'meta') {
+	            const variant = ev.variant || 'uncontrolled';
+	            const metaText = formatMetrics(ev);
+	            if (variantsUI) {
+	              // show metrics in the variant header
+	              if (variantMsg && variantMsg.setMeta) variantMsg.setMeta(variant, metaText);
+	              return;
+	            }
+            if (!bubbles[variant]) return;
+            if (bubbles[variant].footerEl) bubbles[variant].footerEl.textContent = metaText;
             return;
           }
           if (ev.type === 'done') {
@@ -1633,78 +1662,6 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
         };
       }
 
-      async function runBenchmark() {
-        if (isGenerating) return;
-        const msg = input.value.trim();
-        if (!msg) return;
-        input.value = '';
-        addMessage('user', msg);
-
-        const settings = getSettings();
-        setStatus('Benchmarking...', false);
-        benchBtn.disabled = true;
-        sendBtn.disabled = true;
-
-        const items = [
-          { key: 'weak', label: 'Weak', meta: settings.weak_model },
-          { key: 'mid', label: 'Mid', meta: settings.mid_model },
-          { key: 'strong', label: 'Strong', meta: settings.strong_model },
-        ];
-        const variantMsg = addVariantMessageN(items);
-
-        try {
-          const res = await fetch('/api/benchmark', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              prompt: msg,
-              system_prompt: settings.system_prompt,
-              temperature: settings.temperature,
-              top_p: settings.top_p,
-              max_tokens: 0,
-              weak_model: settings.weak_model,
-              mid_model: settings.mid_model,
-              strong_model: settings.strong_model,
-              weak_pricing: { input_per_1m_usd: settings.weak_in, output_per_1m_usd: settings.weak_out },
-              mid_pricing: { input_per_1m_usd: settings.mid_in, output_per_1m_usd: settings.mid_out },
-              strong_pricing: { input_per_1m_usd: settings.strong_in, output_per_1m_usd: settings.strong_out },
-            })
-          });
-          if (!res.ok) {
-            const txt = await res.text();
-            addMessage('assistant', txt, 'Error');
-            setStatus('Error', true);
-            return;
-          }
-          const data = await res.json();
-          for (const r of (data.results || [])) {
-            const key = (r.tier || '').toLowerCase();
-            const usage = r.usage || {};
-            const cost = (r.cost_usd && r.cost_usd > 0) ? ('$' + r.cost_usd.toFixed(6)) : 'n/a';
-            const meta = String(r.model) + ' • ' + String(r.duration_ms) + 'ms • in ' + String(usage.InputTokens||0) + ' / out ' + String(usage.OutputTokens||0) + ' • ' + String(cost);
-            const item = items.find(i => i.key === key);
-            if (item) item.meta = meta;
-            if (r.error) {
-              variantMsg.setText(key, 'ERROR: ' + r.error);
-            } else {
-              variantMsg.setText(key, r.answer || '');
-            }
-          }
-          variantMsg.setIdx(0);
-          if (data.summary) addMessage('assistant', data.summary, 'Summary');
-          if (data.links && data.links.length) {
-            const lines = data.links.map(l => String(l.title) + ': ' + String(l.url)).join('\n');
-            addMessage('assistant', lines, 'Links');
-          }
-          setStatus('', false);
-        } catch (e) {
-          addMessage('assistant', String(e), 'Error');
-          setStatus('Error', true);
-        } finally {
-          benchBtn.disabled = false;
-          sendBtn.disabled = false;
-        }
-      }
 
       async function stopGeneration() {
         try { await fetch('/api/stop', { method: 'POST' }); } catch {}
@@ -1722,7 +1679,6 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
         if (isGenerating) return stopGeneration();
         return sendMessage();
       });
-      benchBtn.addEventListener('click', () => runBenchmark());
       resetBtn.addEventListener('click', async () => {
         await fetch('/api/reset', { method: 'POST' });
         await loadHistory();
@@ -1736,6 +1692,7 @@ var chatPageTmpl = template.Must(template.New("chat").Parse(`<!doctype html>
 
       loadHistory();
       refreshHealth();
+      loadModels();
     </script>
   </body>
 </html>`))
@@ -1779,6 +1736,55 @@ func runServer(addr, defaultModel string) error {
 		})
 	})
 
+	mux.HandleFunc("/api/models", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = getSessionID(w, r)
+		if strings.TrimSpace(apiKey) == "" {
+			http.Error(w, "missing OPENAI_API_KEY", http.StatusBadRequest)
+			return
+		}
+
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, "https://api.openai.com/v1/models", nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		raw, err := io.ReadAll(resp.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			http.Error(w, strings.TrimSpace(string(raw)), resp.StatusCode)
+			return
+		}
+
+		var ml modelsListResponse
+		if err := json.Unmarshal(raw, &ml); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		ids := make([]string, 0, len(ml.Data))
+		for _, m := range ml.Data {
+			if strings.TrimSpace(m.ID) == "" {
+				continue
+			}
+			ids = append(ids, m.ID)
+		}
+		sort.Strings(ids)
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"models": ids})
+	})
+
 	mux.HandleFunc("/api/history", func(w http.ResponseWriter, r *http.Request) {
 		sid, err := getSessionID(w, r)
 		if err != nil {
@@ -1816,146 +1822,6 @@ func runServer(addr, defaultModel string) error {
 		}
 		_ = store.stop(sid)
 		w.WriteHeader(http.StatusNoContent)
-	})
-
-	mux.HandleFunc("/api/benchmark", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		if strings.TrimSpace(apiKey) == "" {
-			http.Error(w, "missing OPENAI_API_KEY", http.StatusBadRequest)
-			return
-		}
-
-		var req benchmarkRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		prompt := strings.TrimSpace(req.Prompt)
-		if prompt == "" {
-			http.Error(w, "prompt is empty", http.StatusBadRequest)
-			return
-		}
-		systemPrompt := strings.TrimSpace(req.SystemPrompt)
-
-		weakModel := strings.TrimSpace(req.WeakModel)
-		midModel := strings.TrimSpace(req.MidModel)
-		strongModel := strings.TrimSpace(req.StrongModel)
-		if weakModel == "" || midModel == "" || strongModel == "" {
-			http.Error(w, "models are required (weak_model, mid_model, strong_model)", http.StatusBadRequest)
-			return
-		}
-
-		temperature := req.Temperature
-		if temperature == 0 {
-			temperature = 1
-		}
-		topP := req.TopP
-		if topP == 0 {
-			topP = 1
-		}
-		maxTokens := req.MaxTokens
-
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
-		defer cancel()
-
-		type tierCfg struct {
-			tier  string
-			model string
-			price modelPricing
-		}
-		cfgs := []tierCfg{
-			{tier: "weak", model: weakModel, price: req.WeakPricing},
-			{tier: "mid", model: midModel, price: req.MidPricing},
-			{tier: "strong", model: strongModel, price: req.StrongPricing},
-		}
-
-		results := make([]benchmarkResult, 0, len(cfgs))
-		for _, c := range cfgs {
-			gen := generationParams{
-				Model:       c.model,
-				Temperature: temperature,
-				TopP:        topP,
-				TopK:        0,
-				MaxTokens:   maxTokens,
-			}
-			control := requestControl{Gen: gen}
-			if systemPrompt != "" {
-				control.Instructions = systemPrompt
-			}
-
-			start := time.Now()
-			answer, usage, err := callChatGPTWithUsage(ctx, client, apiKey, control, prompt)
-			dur := time.Since(start)
-
-			r := benchmarkResult{
-				Tier:       c.tier,
-				Model:      c.model,
-				DurationMs: dur.Milliseconds(),
-				Usage:      usage,
-				Answer:     answer,
-			}
-			if err != nil {
-				r.Error = err.Error()
-			} else {
-				r.CostUSD = estimateCostUSD(c.price, usage)
-			}
-			results = append(results, r)
-		}
-
-		// summary
-		bestLatency := benchmarkResult{}
-		bestLatencySet := false
-		bestTokens := benchmarkResult{}
-		bestTokensSet := false
-		bestCost := benchmarkResult{}
-		bestCostSet := false
-		for _, r := range results {
-			if r.Error != "" {
-				continue
-			}
-			if !bestLatencySet || r.DurationMs < bestLatency.DurationMs {
-				bestLatency = r
-				bestLatencySet = true
-			}
-			if !bestTokensSet || r.Usage.TotalTokens < bestTokens.Usage.TotalTokens {
-				bestTokens = r
-				bestTokensSet = true
-			}
-			if r.CostUSD > 0 {
-				if !bestCostSet || r.CostUSD < bestCost.CostUSD {
-					bestCost = r
-					bestCostSet = true
-				}
-			}
-		}
-		var summaryParts []string
-		if bestLatencySet {
-			summaryParts = append(summaryParts, fmt.Sprintf("Fastest: %s (%dms)", bestLatency.Model, bestLatency.DurationMs))
-		}
-		if bestTokensSet {
-			summaryParts = append(summaryParts, fmt.Sprintf("Lowest tokens: %s (%d total)", bestTokens.Model, bestTokens.Usage.TotalTokens))
-		}
-		if bestCostSet {
-			summaryParts = append(summaryParts, fmt.Sprintf("Cheapest (estimated): %s ($%.6f)", bestCost.Model, bestCost.CostUSD))
-		} else {
-			summaryParts = append(summaryParts, "Cost: n/a (set Pricing in UI to estimate)")
-		}
-		summaryParts = append(summaryParts, "Quality: compare the three answers in the variants.")
-
-		resp := benchmarkResponse{
-			Results: results,
-			Summary: strings.Join(summaryParts, "\n"),
-			Links: []benchmarkLink{
-				{Title: "OpenAI models", URL: "https://platform.openai.com/docs/models"},
-				{Title: "OpenAI pricing", URL: "https://platform.openai.com/pricing"},
-				{Title: "Hugging Face models", URL: "https://huggingface.co/models"},
-			},
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
 	})
 
 	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
@@ -2068,7 +1934,7 @@ func runServer(addr, defaultModel string) error {
 				control = requestControl{Gen: baseGen}
 			}
 			var b strings.Builder
-			err := callChatGPTStream(ctx, client, apiKey, control, prompt, func(d string) {
+			_, err := callChatGPTStream(ctx, client, apiKey, control, prompt, func(d string) {
 				b.WriteString(d)
 				_ = writeSSE(w, f, sseOut{Type: "delta", Variant: variant, Delta: d})
 			})
@@ -2131,6 +1997,8 @@ func runServer(addr, defaultModel string) error {
 		systemPrompt := strings.TrimSpace(r.URL.Query().Get("system_prompt"))
 		temperature := parseFloatDefault(r.URL.Query().Get("temperature"), 1)
 		topP := parseFloatDefault(r.URL.Query().Get("top_p"), 1)
+		priceIn := parseFloatDefault(r.URL.Query().Get("price_in"), 0)
+		priceOut := parseFloatDefault(r.URL.Query().Get("price_out"), 0)
 		compare := r.URL.Query().Get("compare") == "1"
 		controlOnly := r.URL.Query().Get("control") == "1"
 		controlMaxTokens := parseIntDefault(r.URL.Query().Get("control_max_tokens"), defaultControlMaxTokens)
@@ -2202,6 +2070,8 @@ func runServer(addr, defaultModel string) error {
 		var uncontrolledAnswer strings.Builder
 		var singleAnswer strings.Builder
 
+		pricing := modelPricing{InputPer1MUSD: priceIn, OutputPer1MUSD: priceOut}
+
 		runVariant := func(variant string) error {
 			if err := writeSSE(w, f, sseOut{Type: "begin", Variant: variant}); err != nil {
 				return err
@@ -2214,13 +2084,29 @@ func runServer(addr, defaultModel string) error {
 				control = baseControl
 			}
 			var b strings.Builder
-			err := callChatGPTStream(ctx, client, apiKey, control, prompt, func(d string) {
+			start := time.Now()
+			usage, err := callChatGPTStream(ctx, client, apiKey, control, prompt, func(d string) {
 				b.WriteString(d)
 				_ = writeSSE(w, f, sseOut{Type: "delta", Variant: variant, Delta: d})
 			})
+			dur := time.Since(start)
 			if err != nil {
 				return err
 			}
+
+			cost := 0.0
+			if pricing.InputPer1MUSD > 0 || pricing.OutputPer1MUSD > 0 {
+				cost = estimateCostUSD(pricing, usage)
+			}
+			_ = writeSSE(w, f, sseOut{
+				Type:       "meta",
+				Variant:    variant,
+				Model:      control.Gen.Model,
+				DurationMs: dur.Milliseconds(),
+				Usage:      usage,
+				CostUSD:    cost,
+			})
+
 			if err := writeSSE(w, f, sseOut{Type: "done", Variant: variant}); err != nil {
 				return err
 			}

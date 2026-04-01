@@ -1,4 +1,4 @@
-# Lesson 5 — Benchmark моделей (Go)
+# Lesson 5 — Метрики ответа (Go)
 
 Минимальный пример на Go, который делает запросы к ChatGPT через OpenAI API и показывает результат:
 
@@ -72,19 +72,17 @@ go run . -mode=serve -addr 127.0.0.1:8080
 - `control` — один запрос с контролем (формат + длина + stop)
 - `compare` — два ответа подряд: **без ограничений** и **с ограничениями**
 
-## 4) Benchmark: слабая/средняя/сильная модель
+## 4) Метрики ответа: время, токены, стоимость
 
-В веб-интерфейсе есть блок **Benchmark (3 models)**:
+В веб-интерфейсе:
 
-- задайте модели (например `gpt-5.2-nano`, `gpt-5.2-mini`, `gpt-5.2`)
-- отправьте один и тот же запрос кнопкой **Benchmark**
-- получите:
+- выберите модель из выпадающего списка (weak/mid/strong)
+- после каждого ответа выводятся:
   - время ответа (ms)
-  - токены (in/out/total)
-  - стоимость (если заполнить Pricing: USD per 1M tokens)
+  - токены (in/out/total, если API вернул usage)
+  - стоимость (если заполнить Pricing для выбранной модели)
 
 Ссылки:
 
 - OpenAI models: https://platform.openai.com/docs/models
 - OpenAI pricing: https://platform.openai.com/pricing
-- Hugging Face models: https://huggingface.co/models
